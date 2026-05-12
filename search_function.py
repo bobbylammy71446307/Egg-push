@@ -3,6 +3,9 @@ from copy import deepcopy
 import random as rand
 from scipy.optimize import linear_sum_assignment
 from queue import PriorityQueue
+import heapq
+import time
+from collections import deque
 
 directions={"up":[-1,0],
             "down":[1,0],
@@ -169,6 +172,7 @@ class A_star():
         self.open_list=PriorityQueue()
         self.closed_list=set()
         self.valid_cell=[0,4]
+        self.nodes_expanded=0
 
     def a_star(self):
         # Add the starting node to the open list
@@ -179,6 +183,7 @@ class A_star():
         while self.open_list.qsize()> 0:
             # Sort the open list by f(n) = g(n) + h(n)
             current_node = self.open_list.get()
+            self.nodes_expanded+=1
 
             if (current_node.coordinate == self.goal).all():
                 #print("Found a path to the goal!")
@@ -234,10 +239,16 @@ class Solver():
         self.exit=False
         self.path=[]
         self.mouse_path=[]
+        self.stats={"nodes_expanded":0,"astar_calls":0,"retries":0,"elapsed":0.0,"steps":0}
     
 
     def init_map(self):
         self.m=Map()
+        self.assignment=self.m.assign_eggs_to_holes()
+        self.order=self.m.greedy_mouse_visit(self.assignment)
+
+    def load_map(self,shared_map):
+        self.m=shared_map
         self.assignment=self.m.assign_eggs_to_holes()
         self.order=self.m.greedy_mouse_visit(self.assignment)
     
@@ -260,12 +271,18 @@ class Solver():
         hole_coord=self.m.hole_list[hole_index]
         #print(self.create_partial_map(egg_coord,hole_coord))
         egg_hole_search=A_star(egg_coord,hole_coord,self.create_partial_map(egg_coord,hole_coord))
-        return egg_hole_search.a_star()
+        result=egg_hole_search.a_star()
+        self.stats["astar_calls"]+=1
+        self.stats["nodes_expanded"]+=egg_hole_search.nodes_expanded
+        return result
 
     def mouse_hole_search(self,mouse_coordinate,mouse_nxt_to_egg):
         #print(self.create_partial_map())
         mouse_hole_search=A_star(mouse_coordinate,mouse_nxt_to_egg,self.create_partial_map(),is_mouse=True)
-        return mouse_hole_search.a_star()
+        result=mouse_hole_search.a_star()
+        self.stats["astar_calls"]+=1
+        self.stats["nodes_expanded"]+=mouse_hole_search.nodes_expanded
+        return result
 
     def get_complete_path(self,mouse_path,path,egg_coordinate):
         last_is_dir=False
@@ -286,6 +303,8 @@ class Solver():
                 goal_pos=cell.parent.coordinate-np.array(directions[cell.direction])
                 inter_search=A_star(last_coordinate,goal_pos,self.create_partial_map(egg_coordinate=egg_coordinate,partial_egg=cell.parent.coordinate),is_mouse=True)
                 _,inter_path=inter_search.a_star()
+                self.stats["astar_calls"]+=1
+                self.stats["nodes_expanded"]+=inter_search.nodes_expanded
                 if inter_path is None:
                     return None
                 for inter_cell in inter_path:
@@ -302,11 +321,17 @@ class Solver():
 
  
 
-    def main(self):
+    def main(self,shared_map=None):
+        t0=time.perf_counter()
         while not self.complete:
             self.complete_path=[]
             self.exit=False
-            self.init_map()
+            if shared_map is not None:
+                self.load_map(shared_map)
+                shared_map=None
+            else:
+                self.init_map()
+                self.stats["retries"]+=1
             print(self.m.map)
             mouse_coordinate=np.array([self.m.row-2,1])
             for visit_egg_coordinate in self.order:
@@ -345,12 +370,164 @@ class Solver():
                 #print("search complete")
                 print(self.complete_path)
                 self.complete=True
+        self.stats["elapsed"]=time.perf_counter()-t0
+        self.stats["steps"]=len(self.complete_path)
         return self.complete_path
 
 
 
 
 
+class SokobanSolver():
+    """Unified state-space A*: one search over (mouse_pos, frozenset(egg_positions)).
+
+    Produces a globally optimal push plan. The trajectory returned matches the
+    legacy Solver: a list of [row, col] mouse positions, one per tick, where
+    a push is a tick in which the mouse steps onto an egg's cell and the egg
+    advances by one cell in the same direction.
+    """
+
+    def __init__(self):
+        self.stats={"nodes_expanded":0,"astar_calls":1,"retries":0,"elapsed":0.0,"steps":0}
+        self.complete_path=[]
+        self.m=None
+
+    def init_map(self):
+        self.m=Map()
+
+    def load_map(self,shared_map):
+        self.m=shared_map
+
+    def _passable(self,r,c):
+        if r<0 or r>=self.m.row or c<0 or c>=self.m.column:
+            return False
+        return self.m.map[r][c]!=1
+
+    def _bfs_distance_map(self,target):
+        INF=10**9
+        dist=[[INF]*self.m.column for _ in range(self.m.row)]
+        dist[target[0]][target[1]]=0
+        q=deque([(target[0],target[1])])
+        while q:
+            r,c=q.popleft()
+            for dr,dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                nr,nc=r+dr,c+dc
+                if 0<=nr<self.m.row and 0<=nc<self.m.column and self.m.map[nr][nc]!=1 and dist[nr][nc]==INF:
+                    dist[nr][nc]=dist[r][c]+1
+                    q.append((nr,nc))
+        return dist
+
+    def _is_corner_deadlock(self,eggs,holes):
+        for er,ec in eggs:
+            if (er,ec) in holes:
+                continue
+            up=not self._passable(er-1,ec)
+            down=not self._passable(er+1,ec)
+            left=not self._passable(er,ec-1)
+            right=not self._passable(er,ec+1)
+            if (up or down) and (left or right):
+                return True
+        return False
+
+    def _heuristic(self,eggs,holes):
+        total=0
+        for e in eggs:
+            if e in holes:
+                continue
+            best=10**9
+            for h in holes:
+                d=self._hole_dist[h][e[0]][e[1]]
+                if d<best:
+                    best=d
+            if best>=10**9:
+                return 10**9
+            total+=best
+        return total
+
+    def _neighbors(self,mouse,eggs):
+        for dr,dc in ((-1,0),(1,0),(0,-1),(0,1)):
+            nr,nc=mouse[0]+dr,mouse[1]+dc
+            if nr<0 or nr>=self.m.row or nc<0 or nc>=self.m.column:
+                continue
+            if self.m.map[nr][nc]==1:
+                continue
+            if (nr,nc) in eggs:
+                br,bc=nr+dr,nc+dc
+                if br<0 or br>=self.m.row or bc<0 or bc>=self.m.column:
+                    continue
+                if self.m.map[br][bc]==1:
+                    continue
+                if (br,bc) in eggs:
+                    continue
+                new_eggs=frozenset(e for e in eggs if e!=(nr,nc))|{(br,bc)}
+                yield (nr,nc),new_eggs
+            else:
+                yield (nr,nc),eggs
+
+    def search(self):
+        holes=frozenset((int(h[0]),int(h[1])) for h in self.m.hole_list)
+        eggs0=frozenset((int(e[0]),int(e[1])) for e in self.m.egg_list)
+        start=(int(self.m.row-2),1)
+
+        self._hole_dist={h:self._bfs_distance_map(h) for h in holes}
+
+        h0=self._heuristic(eggs0,holes)
+        if h0>=10**9:
+            return None
+
+        counter=0
+        open_heap=[(h0,0,counter,start,eggs0)]
+        came_from={(start,eggs0):None}
+        g_score={(start,eggs0):0}
+
+        while open_heap:
+            f,g,_,mouse,eggs=heapq.heappop(open_heap)
+            self.stats["nodes_expanded"]+=1
+            key=(mouse,eggs)
+
+            if eggs==holes:
+                path=[key]
+                while came_from.get(path[-1]) is not None:
+                    path.append(came_from[path[-1]])
+                path.reverse()
+                return [list(n[0]) for n in path]
+
+            if g_score.get(key,10**9)<g:
+                continue
+
+            if self._is_corner_deadlock(eggs,holes):
+                continue
+
+            for new_mouse,new_eggs in self._neighbors(mouse,eggs):
+                ng=g+1
+                nkey=(new_mouse,new_eggs)
+                if ng<g_score.get(nkey,10**9):
+                    nh=self._heuristic(new_eggs,holes)
+                    if nh>=10**9:
+                        continue
+                    g_score[nkey]=ng
+                    came_from[nkey]=key
+                    counter+=1
+                    heapq.heappush(open_heap,(ng+nh,ng,counter,new_mouse,new_eggs))
+        return None
+
+    def main(self,shared_map=None):
+        t0=time.perf_counter()
+        if shared_map is not None:
+            self.load_map(shared_map)
+        else:
+            self.init_map()
+        path=self.search()
+        self.complete_path=path if path is not None else []
+        self.stats["elapsed"]=time.perf_counter()-t0
+        self.stats["steps"]=len(self.complete_path)
+        return self.complete_path
+
+
 if __name__ == "__main__":
-    S=Solver()
-    S.main()
+    import copy
+    m=Map()
+    S=Solver(); S.main(shared_map=copy.deepcopy(m))
+    T=SokobanSolver(); T.main(shared_map=copy.deepcopy(m))
+    print("legacy",S.stats)
+    print("sokoban",T.stats)
